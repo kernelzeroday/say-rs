@@ -72,10 +72,13 @@ impl Display {
         let gap = now.duration_since(prev_cb);
         let our_time = prev_done.duration_since(prev_cb);
         let slack_ms = gap.saturating_sub(our_time).as_millis() as f64;
-        if slack_ms < 5.0 {
-            return Duration::ZERO;
+        // Cap slack at 500ms so a long pause (em-dash, comma) doesn't
+        // cause the next word to dump all at once
+        let usable_slack = slack_ms.min(500.0);
+        if usable_slack < 5.0 {
+            return Duration::from_millis(2);
         }
-        let delay_ms = (slack_ms * 0.7 / printable_chars.max(1) as f64).clamp(0.0, 20.0);
+        let delay_ms = (usable_slack * 0.7 / printable_chars.max(1) as f64).clamp(2.0, 20.0);
         Duration::from_micros((delay_ms * 1000.0) as u64)
     }
 
