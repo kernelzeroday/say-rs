@@ -112,9 +112,8 @@ fn speak(
 }
 
 extern "C" fn handle_sigint(_: libc::c_int) {
-    // Reset scroll region, show cursor, clear any partial escape state
-    let _ = io::stdout().write_all(b"\x1b[r\x1b[?25h\n");
-    let _ = io::stderr().write_all(b"\x1b[0m\x1b[2K");
+    let _ = io::stderr().write_all(b"\r\x1b[2K\x1b[0m");
+    let _ = io::stdout().write_all(b"\n");
     unsafe { libc::_exit(130) };
 }
 

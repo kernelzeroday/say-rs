@@ -32,50 +32,20 @@ impl Utf16Map {
     }
 }
 
-fn terminal_height() -> u16 {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 {
-            ws.ws_row
-        } else {
-            0
-        }
-    }
-}
-
 pub struct Display {
     text: String,
     map: Utf16Map,
     interactive: bool,
-    #[allow(dead_code)]
     progress: bool,
     total_utf16: usize,
     emitted_up_to: usize,
-    term_height: u16,
-    use_scroll_region: bool,
+    progress_visible: bool,
+    stderr_is_tty: bool,
+    last_pct: f64,
 }
 
 impl Display {
     pub fn new(text: &str, interactive: bool, progress: bool) -> Self {
-        let is_tty = io::stdout().is_terminal();
-        let term_height = if is_tty { terminal_height() } else { 0 };
-        let use_scroll_region = progress && term_height > 2 && is_tty;
-
-        if use_scroll_region {
-            let mut out = io::stdout();
-            // Set scroll region to all rows except the last
-            write!(out, "\x1b[1;{}r", term_height - 1).ok();
-            // Draw empty progress bar on bottom line
-            write!(
-                out,
-                "\x1b7\x1b[{};1H\x1b[2K  [\x1b[32m{}\x1b[0m]   0%\x1b8",
-                term_height,
-                "\u{2591}".repeat(30),
-            )
-            .ok();
-            out.flush().ok();
-        }
-
         Self {
             text: text.to_string(),
             map: Utf16Map::new(text),
@@ -83,8 +53,40 @@ impl Display {
             progress,
             total_utf16: text.encode_utf16().count(),
             emitted_up_to: 0,
-            term_height,
-            use_scroll_region,
+            progress_visible: false,
+            stderr_is_tty: io::stderr().is_terminal(),
+            last_pct: 0.0,
+        }
+    }
+
+    fn draw_progress(&mut self, utf16_done: usize) {
+        let pct = if self.total_utf16 > 0 {
+            (utf16_done as f64 / self.total_utf16 as f64).min(1.0)
+        } else {
+            1.0
+        };
+        self.last_pct = pct;
+        let width = 30;
+        let filled = (pct * width as f64) as usize;
+        let mut err = io::stderr();
+        write!(
+            err,
+            "  \x1b[2m[\x1b[32m{}{}\x1b[0;2m] {:3.0}%\x1b[0m",
+            "\u{2588}".repeat(filled),
+            "\u{2591}".repeat(width - filled),
+            pct * 100.0,
+        )
+        .ok();
+        err.flush().ok();
+        self.progress_visible = true;
+    }
+
+    fn clear_progress(&mut self) {
+        if self.progress_visible {
+            let mut err = io::stderr();
+            write!(err, "\r\x1b[2K").ok();
+            err.flush().ok();
+            self.progress_visible = false;
         }
     }
 
@@ -92,69 +94,65 @@ impl Display {
         let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
 
         if self.interactive && byte_start >= self.emitted_up_to {
-            let chunk = &self.text[self.emitted_up_to..byte_end];
+            self.clear_progress();
+
+            let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
             let mut out = io::stdout();
+            let utf16_done = utf16_pos + utf16_len;
+
             for ch in chunk.chars() {
-                write!(out, "{}", ch).ok();
-                out.flush().ok();
-                if !ch.is_whitespace() {
-                    std::thread::sleep(Duration::from_millis(8));
+                if ch == '\n' {
+                    write!(out, "\n").ok();
+                    out.flush().ok();
+                    if self.progress && self.stderr_is_tty {
+                        self.draw_progress(utf16_done);
+                    }
+                } else {
+                    write!(out, "{}", ch).ok();
+                    out.flush().ok();
+                    if !ch.is_whitespace() {
+                        std::thread::sleep(Duration::from_millis(8));
+                    }
                 }
             }
-            self.emitted_up_to = byte_end;
-        }
 
-        if self.use_scroll_region {
-            let chars_done = utf16_pos + utf16_len;
-            let pct = if self.total_utf16 > 0 {
-                (chars_done as f64 / self.total_utf16 as f64).min(1.0)
-            } else {
-                1.0
-            };
-            let width = 30;
-            let filled = (pct * width as f64) as usize;
-            let mut out = io::stdout();
-            write!(
-                out,
-                "\x1b7\x1b[{};1H\x1b[2K  [\x1b[32m{}{}\x1b[0m] {:3.0}%\x1b8",
-                self.term_height,
-                "\u{2588}".repeat(filled),
-                "\u{2591}".repeat(width - filled),
-                pct * 100.0,
-            )
-            .ok();
-            out.flush().ok();
+            self.emitted_up_to = byte_end;
+        } else if self.progress && self.stderr_is_tty && !self.interactive {
+            let utf16_done = utf16_pos + utf16_len;
+            self.clear_progress();
+            self.draw_progress(utf16_done);
         }
     }
 
     pub fn finish(&mut self) {
-        let mut out = io::stdout();
-
-        if self.use_scroll_region {
-            // Clear the progress bar line and reset scroll region
-            write!(
-                out,
-                "\x1b7\x1b[{};1H\x1b[2K\x1b8\x1b[r",
-                self.term_height,
-            )
-            .ok();
-        }
+        self.clear_progress();
 
         if self.interactive {
+            let mut out = io::stdout();
             writeln!(out).ok();
+            out.flush().ok();
         }
 
-        out.flush().ok();
+        if self.progress && self.stderr_is_tty {
+            let width = 30;
+            let mut err = io::stderr();
+            write!(
+                err,
+                "  \x1b[2m[\x1b[32m{}\x1b[0;2m] 100%\x1b[0m\n",
+                "\u{2588}".repeat(width),
+            )
+            .ok();
+            err.flush().ok();
+        }
     }
 }
 
 impl Drop for Display {
     fn drop(&mut self) {
-        if self.use_scroll_region {
-            let mut out = io::stdout();
-            // Reset scroll region in case of early exit
-            write!(out, "\x1b[r").ok();
-            out.flush().ok();
+        if self.progress_visible {
+            let mut err = io::stderr();
+            write!(err, "\r\x1b[2K").ok();
+            err.flush().ok();
         }
     }
 }
