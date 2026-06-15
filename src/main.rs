@@ -2,7 +2,7 @@ mod synth;
 mod ui;
 
 use clap::Parser;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process;
 
 #[derive(Parser)]
@@ -23,12 +23,12 @@ struct Cli {
     #[arg(short = 'f', long = "input-file")]
     file: Option<String>,
 
-    /// Highlight words as they are spoken
-    #[arg(short = 'i', long = "interactive")]
+    /// Stream words as they are spoken (default: on)
+    #[arg(short = 'i', long = "interactive", default_value_t = true, action = clap::ArgAction::SetTrue)]
     interactive: bool,
 
-    /// Show progress bar
-    #[arg(long = "progress")]
+    /// Show progress bar (default: on)
+    #[arg(long = "progress", default_value_t = true, action = clap::ArgAction::SetTrue)]
     progress: bool,
 
     /// Suppress all output (just speak)
@@ -111,7 +111,15 @@ fn speak(
     Ok(())
 }
 
+extern "C" fn handle_sigint(_: libc::c_int) {
+    let _ = io::stdout().write_all(b"\x1b[?25h\n");
+    let _ = io::stderr().write_all(b"\x1b[0m\x1b[2K");
+    unsafe { libc::_exit(130) };
+}
+
 fn main() {
+    unsafe { libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t) };
+
     if let Err(e) = run() {
         eprintln!("say: {}", e);
         process::exit(1);

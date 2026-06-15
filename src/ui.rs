@@ -37,50 +37,33 @@ pub struct Display {
     interactive: bool,
     progress: bool,
     total_utf16: usize,
-    lines: usize,
-    started: bool,
+    emitted_up_to: usize,
 }
 
 impl Display {
     pub fn new(text: &str, interactive: bool, progress: bool) -> Self {
-        let mut out = io::stdout();
-        if interactive {
-            write!(out, "\x1b[?25l").ok();
-            out.flush().ok();
-        }
-        let lines = interactive as usize + progress as usize;
         Self {
             text: text.to_string(),
             map: Utf16Map::new(text),
             interactive,
             progress,
             total_utf16: text.encode_utf16().count(),
-            lines,
-            started: false,
+            emitted_up_to: 0,
         }
     }
 
     pub fn on_word(&mut self, utf16_pos: usize, utf16_len: usize) {
-        let mut out = io::stdout();
+        let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
 
-        if self.started && self.lines > 0 {
-            write!(out, "\x1b[{}A\r", self.lines).ok();
+        if self.interactive && byte_start >= self.emitted_up_to {
+            let mut out = io::stdout();
+            let chunk = &self.text[self.emitted_up_to..byte_end];
+            write!(out, "{}", chunk).ok();
+            out.flush().ok();
+            self.emitted_up_to = byte_end;
         }
 
-        if self.interactive {
-            let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
-            let before = &self.text[..byte_start];
-            let word = &self.text[byte_start..byte_end];
-            let after = &self.text[byte_end..];
-            write!(
-                out,
-                "\x1b[2K{}\x1b[7m{}\x1b[0m{}\n",
-                before, word, after
-            )
-            .ok();
-        }
-
-        if self.progress {
+        if self.progress && !self.interactive {
             let chars_done = utf16_pos + utf16_len;
             let pct = if self.total_utf16 > 0 {
                 (chars_done as f64 / self.total_utf16 as f64).min(1.0)
@@ -89,55 +72,40 @@ impl Display {
             };
             let width = 30;
             let filled = (pct * width as f64) as usize;
+            let mut err = io::stderr();
             write!(
-                out,
-                "\x1b[2K  [\x1b[32m{}{}\x1b[0m] {:3.0}%\n",
+                err,
+                "\r\x1b[2K  [\x1b[32m{}{}\x1b[0m] {:3.0}%",
                 "\u{2588}".repeat(filled),
                 "\u{2591}".repeat(width - filled),
                 pct * 100.0,
             )
             .ok();
+            err.flush().ok();
         }
-
-        out.flush().ok();
-        self.started = true;
     }
 
     pub fn finish(&mut self) {
-        let mut out = io::stdout();
-
-        if self.started && self.lines > 0 {
-            write!(out, "\x1b[{}A\r", self.lines).ok();
+        if self.interactive && self.emitted_up_to < self.text.len() {
+            let mut out = io::stdout();
+            write!(out, "{}", &self.text[self.emitted_up_to..]).ok();
+            out.flush().ok();
         }
 
         if self.interactive {
-            write!(out, "\x1b[2K{}\n", self.text).ok();
+            println!();
         }
 
         if self.progress {
             let width = 30;
+            let mut err = io::stderr();
             write!(
-                out,
-                "\x1b[2K  [\x1b[32m{}\x1b[0m] 100%\n",
+                err,
+                "\r\x1b[2K  [\x1b[32m{}\x1b[0m] 100%\n",
                 "\u{2588}".repeat(width),
             )
             .ok();
-        }
-
-        if self.interactive {
-            write!(out, "\x1b[?25h").ok();
-        }
-
-        out.flush().ok();
-    }
-}
-
-impl Drop for Display {
-    fn drop(&mut self) {
-        if self.interactive {
-            let mut out = io::stdout();
-            write!(out, "\x1b[?25h").ok();
-            out.flush().ok();
+            err.flush().ok();
         }
     }
 }
