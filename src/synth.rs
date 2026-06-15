@@ -55,6 +55,7 @@ unsafe extern "C" {
         property: CFStringRef,
         object: *mut CFTypeRef,
     ) -> i16;
+    #[allow(dead_code)]
     fn SpeechBusy() -> i16;
 
     static kSpeechWordCFCallBack: CFStringRef;
@@ -192,7 +193,7 @@ impl SpeechSession<'_> {
         unsafe {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout_secs, 1);
         }
-        if self.collector.done.load(Ordering::Acquire) || unsafe { SpeechBusy() } == 0 {
+        if self.collector.done.load(Ordering::Acquire) {
             self.done = true;
         }
         self.done
