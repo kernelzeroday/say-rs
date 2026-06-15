@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 const GAP: usize = 2;
+const AVG_CHARS_PER_WORD: f64 = 5.5;
 
 struct Utf16Map {
     utf16_to_byte: Vec<usize>,
@@ -57,12 +58,13 @@ pub struct Display {
     term_width: usize,
     pad_drawn: bool,
     is_tty: bool,
-    prev_cb: Option<Instant>,
-    prev_emit_done: Option<Instant>,
+    start_time: Instant,
+    chars_per_sec: f64,
 }
 
 impl Display {
-    pub fn new(text: &str, interactive: bool, progress: bool) -> Self {
+    pub fn new(text: &str, interactive: bool, progress: bool, rate_wpm: f64) -> Self {
+        let cps = rate_wpm * AVG_CHARS_PER_WORD / 60.0;
         Self {
             text: text.to_string(),
             map: Utf16Map::new(text),
@@ -75,24 +77,22 @@ impl Display {
             term_width: terminal_width(),
             pad_drawn: false,
             is_tty: io::stdout().is_terminal(),
-            prev_cb: None,
-            prev_emit_done: None,
+            start_time: Instant::now(),
+            chars_per_sec: cps,
         }
     }
 
-    fn calc_char_delay(&self, now: Instant, printable_chars: usize) -> Duration {
-        let (Some(prev_cb), Some(prev_done)) = (self.prev_cb, self.prev_emit_done) else {
-            return Duration::from_millis(4);
-        };
-        let gap = now.duration_since(prev_cb);
-        let our_time = prev_done.duration_since(prev_cb);
-        let slack_ms = gap.saturating_sub(our_time).as_millis() as f64;
-        let usable_slack = slack_ms.min(500.0);
-        if usable_slack < 5.0 {
-            return Duration::from_millis(2);
+    fn wait_for_speech(&self, utf16_pos: usize) {
+        if self.chars_per_sec <= 0.0 {
+            return;
         }
-        let delay_ms = (usable_slack * 0.7 / printable_chars.max(1) as f64).clamp(2.0, 20.0);
-        Duration::from_micros((delay_ms * 1000.0) as u64)
+        let target_secs = utf16_pos as f64 / self.chars_per_sec;
+        let target = self.start_time + Duration::from_secs_f64(target_secs);
+        let now = Instant::now();
+        if now < target {
+            let wait = (target - now).min(Duration::from_secs(3));
+            std::thread::sleep(wait);
+        }
     }
 
     fn draw_bar(out: &mut io::Stdout, pct: f64) {
@@ -163,20 +163,20 @@ impl Display {
         let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
 
         if self.interactive && byte_start >= self.emitted_up_to {
-            let now = Instant::now();
             let mut out = io::stdout();
             let show_progress = self.progress && self.is_tty;
 
+            // Wait until speech should have reached this word
+            self.wait_for_speech(utf16_pos);
+
             let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
-            let printable = chunk.chars().filter(|c| !c.is_whitespace()).count();
-            let delay = self.calc_char_delay(now, printable);
 
             for ch in chunk.chars() {
                 write!(out, "{}", ch).ok();
                 out.flush().ok();
                 self.emit_char(ch);
-                if !ch.is_whitespace() && !delay.is_zero() {
-                    std::thread::sleep(delay);
+                if !ch.is_whitespace() {
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             }
             self.emitted_up_to = byte_end;
@@ -186,16 +186,12 @@ impl Display {
                 if !self.pad_drawn {
                     self.create_pad(&mut out, pct);
                 } else if self.visual_rows_since_pad > 0 {
-                    // Text moved down — erase old pad, create fresh
                     self.erase_pad(&mut out);
                     self.create_pad(&mut out, pct);
                 } else {
                     self.update_bar_inplace(&mut out, pct);
                 }
             }
-
-            self.prev_cb = Some(now);
-            self.prev_emit_done = Some(Instant::now());
         } else if self.progress && !self.interactive && self.is_tty {
             let mut out = io::stdout();
             write!(out, "\r\x1b[2K").ok();
@@ -241,12 +237,10 @@ mod tests {
         let mut vt = VTerm::new();
 
         vt.feed(b"Hello");
-        // create_pad
         vt.feed(b"\n\n\n\x1b[2K  [bar10]");
         let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 6);
         vt.feed(up.as_bytes());
 
-        // same-line word: update in place
         vt.feed(b" world");
         let down = format!("\x1b[{}B\r\x1b[2K", gap + 1);
         vt.feed(down.as_bytes());
@@ -254,7 +248,7 @@ mod tests {
         let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 12);
         vt.feed(up.as_bytes());
 
-        assert!(vt.overwrites.is_empty(), "{:?}", vt.overwrites.iter().map(|o| o.to_string()).collect::<Vec<_>>());
+        assert!(vt.overwrites.is_empty());
         assert_eq!(vt.screen_text().lines().filter(|l| l.contains("[bar")).count(), 1);
     }
 
@@ -268,9 +262,7 @@ mod tests {
         let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 6);
         vt.feed(up.as_bytes());
 
-        // cross-line: erase old pad, emit, create new
         vt.feed(b" world\nLine two");
-        // visual_rows_since_pad > 0 → erase + create
         vt.feed(b"\x1b[J");
         vt.feed(b"\n\n\n\x1b[2K  [bar80]");
         let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 9);
@@ -278,9 +270,8 @@ mod tests {
 
         assert!(vt.overwrites.is_empty());
         let s = vt.screen_text();
-        assert!(s.contains("Hello world"), "{s}");
-        assert!(s.contains("Line two"), "{s}");
-        assert!(!s.contains("[bar10]"), "old bar gone: {s}");
+        assert!(s.contains("Hello world"));
+        assert!(s.contains("Line two"));
+        assert!(!s.contains("[bar10]"));
     }
-
 }

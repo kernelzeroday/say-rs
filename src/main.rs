@@ -130,7 +130,8 @@ fn speak(
     let chunks = chunk_text(text);
 
     if interactive || progress {
-        let mut display = ui::Display::new(text, interactive, progress);
+        let rate_wpm = cli.rate.unwrap_or(175.0);
+        let mut display = ui::Display::new(text, interactive, progress, rate_wpm);
         let mut utf16_offset: usize = 0;
 
         for chunk in &chunks {
