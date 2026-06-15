@@ -110,7 +110,7 @@ impl Display {
 
     fn undo_pad(&mut self, out: &mut io::Stdout) {
         if self.pad_active {
-            write!(out, "\x1b[{}A\x1b[{}G", GAP + 1, self.col + 1).ok();
+            write!(out, "\x1b[{}A\x1b[{}G\x1b[J", GAP + 1, self.col + 1).ok();
             self.pad_active = false;
         }
     }
@@ -207,23 +207,22 @@ mod tests {
         vt.feed(b"\n\n\n\x1b[2K");
         vt.feed(b"  [bar] 20%");
 
-        // Word 2: " world" — undo_pad then emit
-        let undo = format!("\x1b[{}A\x1b[{}G", gap + 1, 5 + 1);
+        // Word 2: " world" — undo_pad (with erase below) then emit
+        let undo = format!("\x1b[{}A\x1b[{}G\x1b[J", gap + 1, 5 + 1);
         vt.feed(undo.as_bytes());
         vt.feed(b" world");
-        // draw_pad
         vt.feed(b"\n\n\n\x1b[2K");
         vt.feed(b"  [bar] 60%");
 
-        // Word 3: "\nLine two" — undo_pad then emit
-        let undo = format!("\x1b[{}A\x1b[{}G", gap + 1, 11 + 1);
+        // Word 3: "\nLine two" — undo_pad (with erase below) then emit
+        let undo = format!("\x1b[{}A\x1b[{}G\x1b[J", gap + 1, 11 + 1);
         vt.feed(undo.as_bytes());
         vt.feed(b"\nLine two");
         vt.feed(b"\n\n\n\x1b[2K");
         vt.feed(b"  [bar] 100%");
 
-        // finish — undo_pad
-        let undo = format!("\x1b[{}A\x1b[{}G", gap + 1, 8 + 1);
+        // finish — undo_pad (with erase below)
+        let undo = format!("\x1b[{}A\x1b[{}G\x1b[J", gap + 1, 8 + 1);
         vt.feed(undo.as_bytes());
         vt.feed(b"\n");
 

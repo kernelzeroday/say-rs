@@ -112,7 +112,15 @@ impl VTerm {
                     _ => {}
                 }
             }
-            'm' => {} // SGR (colors/attributes) - ignore
+            'J' => {
+                let mode: usize = params.parse().unwrap_or(0);
+                if mode == 0 {
+                    self.ensure_row(self.row);
+                    self.rows[self.row].truncate(self.col);
+                    self.rows.truncate(self.row + 1);
+                }
+            }
+            'm' => {}
             _ => {}
         }
     }
@@ -254,6 +262,48 @@ mod tests {
         );
         let text = v.screen_text();
         assert!(text.starts_with("Hello world\nSecond line"), "got: {text}");
+    }
+
+    /// Without \x1b[J, old pad lines remain as orphans
+    #[test]
+    fn pad_without_erase_below_leaves_orphans() {
+        let gap = 2;
+        let mut v = VTerm::new();
+
+        v.feed(b"Hello");
+        // draw pad
+        v.feed(b"\n\n\n\x1b[2Kbar10%");
+        // undo WITHOUT erase-below
+        let seq = format!("\x1b[{}A\x1b[{}G", gap + 1, 6);
+        v.feed(seq.as_bytes());
+        // emit text with newline
+        v.feed(b" world\nSecond");
+        // draw new pad
+        v.feed(b"\n\n\n\x1b[2Kbar50%");
+
+        let screen = v.screen_text();
+        // The old "bar10%" is still there as an orphan between the text lines
+        assert!(screen.contains("bar10%"), "old bar should be orphaned: {screen}");
+    }
+
+    /// With \x1b[J in undo_pad, old pad lines are cleaned up
+    #[test]
+    fn pad_with_erase_below_cleans_orphans() {
+        let gap = 2;
+        let mut v = VTerm::new();
+
+        v.feed(b"Hello");
+        v.feed(b"\n\n\n\x1b[2Kbar10%");
+        // undo WITH erase-below
+        let seq = format!("\x1b[{}A\x1b[{}G\x1b[J", gap + 1, 6);
+        v.feed(seq.as_bytes());
+        v.feed(b" world\nSecond");
+        v.feed(b"\n\n\n\x1b[2Kbar50%");
+
+        let screen = v.screen_text();
+        assert!(!screen.contains("bar10%"), "old bar should be erased: {screen}");
+        assert!(screen.contains("Hello world"), "text preserved: {screen}");
+        assert!(screen.contains("Second"), "text preserved: {screen}");
     }
 
     /// Proves the OLD undo_pad with \\r causes overwrites

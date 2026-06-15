@@ -87,6 +87,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     speak(&cli, &s, &text)
 }
 
+const MAX_CHUNK: usize = 2000;
+
+fn chunk_text(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let remaining = &text[start..];
+        if remaining.len() <= MAX_CHUNK {
+            chunks.push(remaining);
+            break;
+        }
+        let end = (start + MAX_CHUNK).min(text.len());
+        let search = &text[start..end];
+        let break_at = search
+            .rfind("\n\n")
+            .map(|i| i + 2)
+            .or_else(|| search.rfind('\n').map(|i| i + 1))
+            .or_else(|| search.rfind(". ").map(|i| i + 2))
+            .unwrap_or(search.len());
+        chunks.push(&text[start..start + break_at]);
+        start += break_at;
+    }
+    chunks
+}
+
 fn speak(
     cli: &Cli,
     s: &synth::Synthesizer,
@@ -99,14 +124,25 @@ fn speak(
     let interactive = cli.interactive && !cli.quiet;
     let progress = cli.progress && !cli.quiet;
 
+    let chunks = chunk_text(text);
+
     if interactive || progress {
         let mut display = ui::Display::new(text, interactive, progress);
-        s.speak(text, |pos, len| {
-            display.on_word(pos, len);
-        })?;
+        let mut utf16_offset: usize = 0;
+
+        for chunk in &chunks {
+            let offset = utf16_offset;
+            s.speak(chunk, |pos, len| {
+                display.on_word(offset + pos, len);
+            })?;
+            utf16_offset += chunk.encode_utf16().count();
+        }
+
         display.finish();
     } else {
-        s.speak(text, |_, _| {})?;
+        for chunk in &chunks {
+            s.speak(chunk, |_, _| {})?;
+        }
     }
 
     Ok(())
