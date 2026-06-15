@@ -98,7 +98,10 @@ fn chunk_text(text: &str) -> Vec<&str> {
             chunks.push(remaining);
             break;
         }
-        let end = (start + MAX_CHUNK).min(text.len());
+        let mut end = (start + MAX_CHUNK).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
         let search = &text[start..end];
         let break_at = search
             .rfind("\n\n")
