@@ -27,8 +27,8 @@ struct Cli {
     #[arg(short = 'i', long = "interactive", default_value_t = true, action = clap::ArgAction::SetTrue)]
     interactive: bool,
 
-    /// Show progress bar (default: on)
-    #[arg(long = "progress", default_value_t = true, action = clap::ArgAction::SetTrue)]
+    /// Show progress bar (standalone, not with streaming)
+    #[arg(long = "progress")]
     progress: bool,
 
     /// Suppress all output (just speak)
