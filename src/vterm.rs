@@ -136,6 +136,12 @@ impl VTerm {
     }
 }
 
+impl Default for VTerm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,15 +180,18 @@ mod tests {
         // cursor-up 3 keeps col=3 (from "bar"), so writing overwrites "lo"
         v.feed(b"\x1b[3A");
         v.feed(b" world");
-        assert!(!v.overwrites.is_empty(), "cursor-up without col fix causes overwrite");
+        assert!(
+            !v.overwrites.is_empty(),
+            "cursor-up without col fix causes overwrite"
+        );
     }
 
     #[test]
     fn cursor_up_with_explicit_col_ok() {
         let mut v = VTerm::new();
-        v.feed(b"Hello");               // col=5
-        v.feed(b"\n\n\nbar");           // col=3 after "bar"
-        v.feed(b"\x1b[3A\x1b[6G");     // up 3, col 6 (1-indexed → col 5)
+        v.feed(b"Hello"); // col=5
+        v.feed(b"\n\n\nbar"); // col=3 after "bar"
+        v.feed(b"\x1b[3A\x1b[6G"); // up 3, col 6 (1-indexed → col 5)
         v.feed(b" world");
         assert_eq!(v.screen_text(), "Hello world\n\n\nbar");
         assert!(v.overwrites.is_empty());
@@ -195,14 +204,17 @@ mod tests {
         v.feed(b"\n\n\nbar");
         v.feed(b"\x1b[3A\r"); // cursor up 3, then CR — col 0!
         v.feed(b"XX");
-        assert!(!v.overwrites.is_empty(), "\\r after cursor-up should cause overwrite");
+        assert!(
+            !v.overwrites.is_empty(),
+            "\\r after cursor-up should cause overwrite"
+        );
     }
 
     #[test]
     fn column_restore_no_overwrite() {
         let mut v = VTerm::new();
-        v.feed(b"Hello");           // col=5
-        v.feed(b"\n\n\nbar");       // 3 lines down, write bar
+        v.feed(b"Hello"); // col=5
+        v.feed(b"\n\n\nbar"); // 3 lines down, write bar
         v.feed(b"\x1b[3A\x1b[6G"); // up 3, column 6 (1-indexed = col 5)
         v.feed(b" world");
         assert_eq!(v.screen_text(), "Hello world\n\n\nbar");
@@ -225,11 +237,10 @@ mod tests {
     fn full_pad_cycle_no_overwrites() {
         let gap = 2;
         let mut v = VTerm::new();
-        let mut col: usize = 0;
 
         // Word 1: "Hello"
         v.feed(b"Hello");
-        col = 5;
+        let mut col = 5;
         // draw pad: GAP blank lines + bar line
         v.feed(b"\n\n\n\x1b[2Kbar10%");
 
@@ -253,12 +264,15 @@ mod tests {
         let seq = format!("\x1b[{}A\x1b[{}G", gap + 1, col + 1);
         v.feed(seq.as_bytes());
         v.feed(b" line");
-        col = 11;
 
         assert!(
             v.overwrites.is_empty(),
             "overwrites detected:\n{}",
-            v.overwrites.iter().map(|o| o.to_string()).collect::<Vec<_>>().join("\n")
+            v.overwrites
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         let text = v.screen_text();
         assert!(text.starts_with("Hello world\nSecond line"), "got: {text}");
@@ -283,7 +297,10 @@ mod tests {
 
         let screen = v.screen_text();
         // The old "bar10%" is still there as an orphan between the text lines
-        assert!(screen.contains("bar10%"), "old bar should be orphaned: {screen}");
+        assert!(
+            screen.contains("bar10%"),
+            "old bar should be orphaned: {screen}"
+        );
     }
 
     /// With \x1b[J in undo_pad, old pad lines are cleaned up
@@ -301,7 +318,10 @@ mod tests {
         v.feed(b"\n\n\n\x1b[2Kbar50%");
 
         let screen = v.screen_text();
-        assert!(!screen.contains("bar10%"), "old bar should be erased: {screen}");
+        assert!(
+            !screen.contains("bar10%"),
+            "old bar should be erased: {screen}"
+        );
         assert!(screen.contains("Hello world"), "text preserved: {screen}");
         assert!(screen.contains("Second"), "text preserved: {screen}");
     }

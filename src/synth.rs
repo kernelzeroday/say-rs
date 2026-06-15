@@ -3,10 +3,11 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use core_foundation_sys::base::{CFRange, CFTypeRef};
 use core_foundation_sys::runloop::{
-    kCFRunLoopDefaultMode, CFRunLoopGetCurrent, CFRunLoopRunInMode, CFRunLoopStop,
+    CFRunLoopGetCurrent, CFRunLoopRunInMode, CFRunLoopStop, kCFRunLoopDefaultMode,
 };
 use std::ffi::c_void;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -48,6 +49,11 @@ unsafe extern "C" {
         voice: *const VoiceSpec,
         info: *mut VoiceDescription,
         info_length: i64,
+    ) -> i16;
+    fn CopySpeechProperty(
+        chan: SpeechChannelPtr,
+        property: CFStringRef,
+        object: *mut CFTypeRef,
     ) -> i16;
     fn SpeechBusy() -> i16;
 
@@ -134,26 +140,98 @@ pub fn find_voice(name: &str) -> Result<Option<VoiceSpec>, SpeechError> {
         .map(|v| v.spec))
 }
 
-struct CallbackContext {
-    word_caller: unsafe fn(*mut c_void, usize, usize),
-    word_data: *mut c_void,
+#[derive(Debug, Clone)]
+pub struct WordEvent {
+    pub utf16_pos: usize,
+    pub utf16_len: usize,
+}
+
+struct CallbackCollector {
+    words: Vec<WordEvent>,
     done: AtomicBool,
 }
 
-extern "C" fn word_trampoline(
+extern "C" fn collect_word(
     _ch: SpeechChannelPtr,
     refcon: *mut c_void,
     _text: CFStringRef,
     range: CFRange,
 ) {
-    let ctx = unsafe { &*(refcon as *const CallbackContext) };
-    unsafe { (ctx.word_caller)(ctx.word_data, range.location as usize, range.length as usize) };
+    if refcon.is_null() {
+        return;
+    }
+    let ctx = unsafe { &mut *(refcon as *mut CallbackCollector) };
+    ctx.words.push(WordEvent {
+        utf16_pos: range.location.max(0) as usize,
+        utf16_len: range.length.max(0) as usize,
+    });
 }
 
-extern "C" fn done_trampoline(_ch: SpeechChannelPtr, refcon: *mut c_void) {
-    let ctx = unsafe { &*(refcon as *const CallbackContext) };
+extern "C" fn collect_done(_ch: SpeechChannelPtr, refcon: *mut c_void) {
+    if refcon.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(refcon as *const CallbackCollector) };
     ctx.done.store(true, Ordering::Release);
     unsafe { CFRunLoopStop(CFRunLoopGetCurrent()) };
+}
+
+pub struct SpeechSession<'a> {
+    channel: SpeechChannelPtr,
+    collector: Box<CallbackCollector>,
+    _cf_text: CFString,
+    done: bool,
+    _owner: PhantomData<&'a Synthesizer>,
+}
+
+impl SpeechSession<'_> {
+    pub fn pump(&mut self, timeout_secs: f64) -> bool {
+        if self.done {
+            return true;
+        }
+        unsafe {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout_secs, 1);
+        }
+        if self.collector.done.load(Ordering::Acquire) || unsafe { SpeechBusy() } == 0 {
+            self.done = true;
+        }
+        self.done
+    }
+
+    pub fn drain_words(&mut self) -> Vec<WordEvent> {
+        std::mem::take(&mut self.collector.words)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+fn clear_speech_property(channel: SpeechChannelPtr, property: CFStringRef) {
+    let zero = CFNumber::from(0_i64);
+    unsafe {
+        SetSpeechProperty(channel, property, zero.as_CFTypeRef());
+    }
+}
+
+fn clear_session_callbacks(channel: SpeechChannelPtr) {
+    unsafe {
+        clear_speech_property(channel, kSpeechWordCFCallBack);
+        clear_speech_property(channel, kSpeechSpeechDoneCallBack);
+        clear_speech_property(channel, kSpeechRefConProperty);
+    }
+}
+
+impl Drop for SpeechSession<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.done {
+                StopSpeech(self.channel);
+            }
+        }
+        clear_session_callbacks(self.channel);
+    }
 }
 
 pub struct Synthesizer {
@@ -182,73 +260,93 @@ impl Synthesizer {
         )
     }
 
+    pub fn get_rate(&self) -> Result<f64, SpeechError> {
+        let mut obj: CFTypeRef = ptr::null();
+        check(
+            unsafe { CopySpeechProperty(self.channel, kSpeechRateProperty, &mut obj) },
+            "failed to get speech rate",
+        )?;
+        if obj.is_null() {
+            return Ok(175.0);
+        }
+        let num = unsafe { CFNumber::wrap_under_create_rule(obj as _) };
+        Ok(num.to_f64().unwrap_or(175.0))
+    }
+
+    pub fn start_speaking(&self, text: &str) -> Result<SpeechSession<'_>, SpeechError> {
+        let collector = Box::new(CallbackCollector {
+            words: Vec::new(),
+            done: AtomicBool::new(false),
+        });
+
+        let refcon_num =
+            CFNumber::from(&*collector as *const CallbackCollector as *const c_void as i64);
+        let word_num = CFNumber::from(collect_word as *const c_void as i64);
+        let done_num = CFNumber::from(collect_done as *const c_void as i64);
+
+        let cf_text = CFString::new(text);
+        let setup_result = (|| {
+            check(
+                unsafe {
+                    SetSpeechProperty(
+                        self.channel,
+                        kSpeechRefConProperty,
+                        refcon_num.as_CFTypeRef(),
+                    )
+                },
+                "failed to set refcon",
+            )?;
+            check(
+                unsafe {
+                    SetSpeechProperty(self.channel, kSpeechWordCFCallBack, word_num.as_CFTypeRef())
+                },
+                "failed to set word callback",
+            )?;
+            check(
+                unsafe {
+                    SetSpeechProperty(
+                        self.channel,
+                        kSpeechSpeechDoneCallBack,
+                        done_num.as_CFTypeRef(),
+                    )
+                },
+                "failed to set done callback",
+            )?;
+            check(
+                unsafe { SpeakCFString(self.channel, cf_text.as_concrete_TypeRef(), ptr::null()) },
+                "SpeakCFString failed",
+            )
+        })();
+
+        if let Err(err) = setup_result {
+            clear_session_callbacks(self.channel);
+            return Err(err);
+        }
+
+        Ok(SpeechSession {
+            channel: self.channel,
+            collector,
+            _cf_text: cf_text,
+            done: false,
+            _owner: PhantomData,
+        })
+    }
+
     pub fn speak<F: FnMut(usize, usize)>(
         &self,
         text: &str,
         mut on_word: F,
     ) -> Result<(), SpeechError> {
-        unsafe fn call_on_word<F: FnMut(usize, usize)>(data: *mut c_void, pos: usize, len: usize) {
-            unsafe { (*(data as *mut F))(pos, len) };
-        }
-
-        let ctx = CallbackContext {
-            word_caller: call_on_word::<F>,
-            word_data: &mut on_word as *mut F as *mut c_void,
-            done: AtomicBool::new(false),
-        };
-
-        let refcon_num = CFNumber::from(&ctx as *const CallbackContext as *const c_void as i64);
-        check(
-            unsafe {
-                SetSpeechProperty(self.channel, kSpeechRefConProperty, refcon_num.as_CFTypeRef())
-            },
-            "failed to set refcon",
-        )?;
-
-        let word_num = CFNumber::from(word_trampoline as *const c_void as i64);
-        check(
-            unsafe {
-                SetSpeechProperty(self.channel, kSpeechWordCFCallBack, word_num.as_CFTypeRef())
-            },
-            "failed to set word callback",
-        )?;
-
-        let done_num = CFNumber::from(done_trampoline as *const c_void as i64);
-        check(
-            unsafe {
-                SetSpeechProperty(
-                    self.channel,
-                    kSpeechSpeechDoneCallBack,
-                    done_num.as_CFTypeRef(),
-                )
-            },
-            "failed to set done callback",
-        )?;
-
-        let cf_text = CFString::new(text);
-        check(
-            unsafe { SpeakCFString(self.channel, cf_text.as_concrete_TypeRef(), ptr::null()) },
-            "SpeakCFString failed",
-        )?;
-
-        // Block until speech completes. Use CFRunLoop to pump callbacks
-        // on this thread. The done callback sets the atomic flag and
-        // stops the run loop. We also poll SpeechBusy as a fallback
-        // in case the done callback fires before the loop starts.
-        while !ctx.done.load(Ordering::Acquire) {
-            unsafe {
-                // returnAfterSourceHandled=1: process ONE callback then return,
-                // so word callbacks aren't delivered in bursts
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, 1);
+        let mut session = self.start_speaking(text)?;
+        loop {
+            let finished = session.pump(5.0);
+            for ev in session.drain_words() {
+                on_word(ev.utf16_pos, ev.utf16_len);
             }
-            if unsafe { SpeechBusy() } == 0 {
+            if finished {
                 break;
             }
         }
-
-        // Keep cf_text alive through the entire speech
-        drop(cf_text);
-
         Ok(())
     }
 
@@ -265,5 +363,31 @@ impl Drop for Synthesizer {
         unsafe {
             DisposeSpeechChannel(self.channel);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_event_drain() {
+        let mut collector = CallbackCollector {
+            words: Vec::new(),
+            done: AtomicBool::new(false),
+        };
+        collector.words.push(WordEvent {
+            utf16_pos: 0,
+            utf16_len: 5,
+        });
+        collector.words.push(WordEvent {
+            utf16_pos: 6,
+            utf16_len: 5,
+        });
+        let drained: Vec<WordEvent> = std::mem::take(&mut collector.words);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].utf16_pos, 0);
+        assert_eq!(drained[1].utf16_pos, 6);
+        assert!(collector.words.is_empty());
     }
 }
