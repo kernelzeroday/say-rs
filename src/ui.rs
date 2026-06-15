@@ -40,8 +40,7 @@ pub struct Display {
     total_utf16: usize,
     emitted_up_to: usize,
     progress_visible: bool,
-    stderr_is_tty: bool,
-    last_pct: f64,
+    is_tty: bool,
 }
 
 impl Display {
@@ -54,38 +53,37 @@ impl Display {
             total_utf16: text.encode_utf16().count(),
             emitted_up_to: 0,
             progress_visible: false,
-            stderr_is_tty: io::stderr().is_terminal(),
-            last_pct: 0.0,
+            is_tty: io::stdout().is_terminal(),
         }
     }
 
-    fn draw_progress(&mut self, utf16_done: usize) {
+    fn draw_progress(&mut self, out: &mut io::Stdout, utf16_done: usize) {
+        if !self.is_tty {
+            return;
+        }
         let pct = if self.total_utf16 > 0 {
             (utf16_done as f64 / self.total_utf16 as f64).min(1.0)
         } else {
             1.0
         };
-        self.last_pct = pct;
         let width = 30;
         let filled = (pct * width as f64) as usize;
-        let mut err = io::stderr();
         write!(
-            err,
+            out,
             "  \x1b[2m[\x1b[32m{}{}\x1b[0;2m] {:3.0}%\x1b[0m",
             "\u{2588}".repeat(filled),
             "\u{2591}".repeat(width - filled),
             pct * 100.0,
         )
         .ok();
-        err.flush().ok();
+        out.flush().ok();
         self.progress_visible = true;
     }
 
-    fn clear_progress(&mut self) {
+    fn clear_progress(&mut self, out: &mut io::Stdout) {
         if self.progress_visible {
-            let mut err = io::stderr();
-            write!(err, "\r\x1b[2K").ok();
-            err.flush().ok();
+            write!(out, "\r\x1b[2K").ok();
+            out.flush().ok();
             self.progress_visible = false;
         }
     }
@@ -94,65 +92,60 @@ impl Display {
         let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
 
         if self.interactive && byte_start >= self.emitted_up_to {
-            self.clear_progress();
+            let mut out = io::stdout();
+            self.clear_progress(&mut out);
 
             let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
-            let mut out = io::stdout();
             let utf16_done = utf16_pos + utf16_len;
 
             for ch in chunk.chars() {
+                write!(out, "{}", ch).ok();
+                out.flush().ok();
                 if ch == '\n' {
-                    write!(out, "\n").ok();
-                    out.flush().ok();
-                    if self.progress && self.stderr_is_tty {
-                        self.draw_progress(utf16_done);
+                    if self.progress {
+                        self.draw_progress(&mut out, utf16_done);
                     }
-                } else {
-                    write!(out, "{}", ch).ok();
-                    out.flush().ok();
-                    if !ch.is_whitespace() {
-                        std::thread::sleep(Duration::from_millis(8));
-                    }
+                } else if !ch.is_whitespace() {
+                    std::thread::sleep(Duration::from_millis(8));
                 }
             }
 
             self.emitted_up_to = byte_end;
-        } else if self.progress && self.stderr_is_tty && !self.interactive {
-            let utf16_done = utf16_pos + utf16_len;
-            self.clear_progress();
-            self.draw_progress(utf16_done);
+        } else if self.progress && !self.interactive {
+            let mut out = io::stdout();
+            self.clear_progress(&mut out);
+            self.draw_progress(&mut out, utf16_pos + utf16_len);
         }
     }
 
     pub fn finish(&mut self) {
-        self.clear_progress();
+        let mut out = io::stdout();
+        self.clear_progress(&mut out);
 
         if self.interactive {
-            let mut out = io::stdout();
             writeln!(out).ok();
-            out.flush().ok();
         }
 
-        if self.progress && self.stderr_is_tty {
+        if self.progress && self.is_tty {
             let width = 30;
-            let mut err = io::stderr();
             write!(
-                err,
+                out,
                 "  \x1b[2m[\x1b[32m{}\x1b[0;2m] 100%\x1b[0m\n",
                 "\u{2588}".repeat(width),
             )
             .ok();
-            err.flush().ok();
         }
+
+        out.flush().ok();
     }
 }
 
 impl Drop for Display {
     fn drop(&mut self) {
         if self.progress_visible {
-            let mut err = io::stderr();
-            write!(err, "\r\x1b[2K").ok();
-            err.flush().ok();
+            let mut out = io::stdout();
+            write!(out, "\r\x1b[2K").ok();
+            out.flush().ok();
         }
     }
 }
