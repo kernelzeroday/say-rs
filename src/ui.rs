@@ -42,7 +42,7 @@ pub struct Display {
     total_utf16: usize,
     emitted_up_to: usize,
     col: usize,
-    pad_active: bool,
+    pad_drawn: bool,
     is_tty: bool,
     prev_cb: Option<Instant>,
     prev_emit_done: Option<Instant>,
@@ -58,7 +58,7 @@ impl Display {
             total_utf16: text.encode_utf16().count(),
             emitted_up_to: 0,
             col: 0,
-            pad_active: false,
+            pad_drawn: false,
             is_tty: io::stdout().is_terminal(),
             prev_cb: None,
             prev_emit_done: None,
@@ -92,12 +92,16 @@ impl Display {
         .ok();
     }
 
-    fn draw_pad(&mut self, out: &mut io::Stdout, utf16_done: usize) {
-        let pct = if self.total_utf16 > 0 {
+    fn pct(&self, utf16_done: usize) -> f64 {
+        if self.total_utf16 > 0 {
             (utf16_done as f64 / self.total_utf16 as f64).min(1.0)
         } else {
             1.0
-        };
+        }
+    }
+
+    /// Draw fresh pad (GAP blank lines + bar) below current cursor.
+    fn create_pad(&mut self, out: &mut io::Stdout, pct: f64) {
         for _ in 0..GAP {
             writeln!(out).ok();
         }
@@ -105,13 +109,25 @@ impl Display {
         write!(out, "\x1b[2K").ok();
         Self::draw_bar(out, pct);
         out.flush().ok();
-        self.pad_active = true;
+        // cursor is now on the bar line; go back to text position
+        write!(out, "\x1b[{}A\x1b[{}G", GAP + 1, self.col + 1).ok();
+        self.pad_drawn = true;
     }
 
-    fn undo_pad(&mut self, out: &mut io::Stdout) {
-        if self.pad_active {
-            write!(out, "\x1b[{}A\x1b[{}G\x1b[J", GAP + 1, self.col + 1).ok();
-            self.pad_active = false;
+    /// Update existing bar in-place (cursor down to bar, overwrite, back up).
+    fn update_bar_inplace(&self, out: &mut io::Stdout, pct: f64) {
+        let dist = GAP + 1;
+        write!(out, "\x1b[{}B\r\x1b[2K", dist).ok();
+        Self::draw_bar(out, pct);
+        write!(out, "\x1b[{}A\x1b[{}G", dist, self.col + 1).ok();
+        out.flush().ok();
+    }
+
+    /// Erase old pad (cursor is at text pos, pad is GAP+1 below) and mark gone.
+    fn erase_pad(&mut self, out: &mut io::Stdout) {
+        if self.pad_drawn {
+            write!(out, "\x1b[J").ok();
+            self.pad_drawn = false;
         }
     }
 
@@ -121,15 +137,24 @@ impl Display {
         if self.interactive && byte_start >= self.emitted_up_to {
             let now = Instant::now();
             let mut out = io::stdout();
-
-            if self.progress && self.is_tty {
-                self.undo_pad(&mut out);
-            }
+            let show_progress = self.progress && self.is_tty;
 
             let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
+            let has_newline = chunk.contains('\n');
             let printable = chunk.chars().filter(|c| !c.is_whitespace()).count();
             let delay = self.calc_char_delay(now, printable);
 
+            if show_progress && self.pad_drawn {
+                if has_newline {
+                    // Text will cross lines — old pad position will be wrong.
+                    // Erase it, emit text, draw fresh pad.
+                    self.erase_pad(&mut out);
+                }
+                // else: same line — emit text at current position,
+                // update bar in-place after.
+            }
+
+            // Emit text chars
             for ch in chunk.chars() {
                 write!(out, "{}", ch).ok();
                 out.flush().ok();
@@ -144,21 +169,21 @@ impl Display {
             }
             self.emitted_up_to = byte_end;
 
-            if self.progress && self.is_tty {
-                self.draw_pad(&mut out, utf16_pos + utf16_len);
+            if show_progress {
+                let pct = self.pct(utf16_pos + utf16_len);
+                if !self.pad_drawn {
+                    self.create_pad(&mut out, pct);
+                } else {
+                    self.update_bar_inplace(&mut out, pct);
+                }
             }
 
             self.prev_cb = Some(now);
             self.prev_emit_done = Some(Instant::now());
         } else if self.progress && !self.interactive && self.is_tty {
-            let pct = if self.total_utf16 > 0 {
-                ((utf16_pos + utf16_len) as f64 / self.total_utf16 as f64).min(1.0)
-            } else {
-                1.0
-            };
             let mut out = io::stdout();
             write!(out, "\r\x1b[2K").ok();
-            Self::draw_bar(&mut out, pct);
+            Self::draw_bar(&mut out, self.pct(utf16_pos + utf16_len));
             out.flush().ok();
         }
     }
@@ -167,8 +192,8 @@ impl Display {
         let mut out = io::stdout();
 
         if self.interactive {
-            if self.progress && self.is_tty {
-                self.undo_pad(&mut out);
+            if self.pad_drawn {
+                self.erase_pad(&mut out);
             }
             writeln!(out).ok();
 
@@ -195,51 +220,57 @@ mod tests {
     use crate::vterm::VTerm;
 
     #[test]
-    fn pad_sequence_matches_verified_pattern() {
-        // Replay the exact byte sequence that Display would produce
-        // for two words with progress=true
+    fn same_line_words_no_flash() {
         let gap = GAP;
         let mut vt = VTerm::new();
 
-        // Word 1: "Hello" (col 0→5)
+        // Word 1: create pad
         vt.feed(b"Hello");
-        // draw_pad
         vt.feed(b"\n\n\n\x1b[2K");
-        vt.feed(b"  [bar] 20%");
+        vt.feed(b"  [bar10]");
+        let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 6);
+        vt.feed(up.as_bytes());
 
-        // Word 2: " world" — undo_pad (with erase below) then emit
-        let undo = format!("\x1b[{}A\x1b[{}G\x1b[J", gap + 1, 5 + 1);
-        vt.feed(undo.as_bytes());
+        // Word 2: emit text, update bar in-place (no gap re-emit)
         vt.feed(b" world");
+        let down = format!("\x1b[{}B\r\x1b[2K", gap + 1);
+        vt.feed(down.as_bytes());
+        vt.feed(b"  [bar50]");
+        let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 12);
+        vt.feed(up.as_bytes());
+
+        assert!(vt.overwrites.is_empty(), "{:?}", vt.overwrites.iter().map(|o| o.to_string()).collect::<Vec<_>>());
+        let s = vt.screen_text();
+        assert!(s.contains("Hello world"), "got: {s}");
+        assert_eq!(s.matches("[bar").count(), 1, "one bar: {s}");
+    }
+
+    #[test]
+    fn cross_line_erases_old_pad() {
+        let gap = GAP;
+        let mut vt = VTerm::new();
+
+        // Word 1: create pad
+        vt.feed(b"Hello");
         vt.feed(b"\n\n\n\x1b[2K");
-        vt.feed(b"  [bar] 60%");
+        vt.feed(b"  [bar10]");
+        let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 6);
+        vt.feed(up.as_bytes());
 
-        // Word 3: "\nLine two" — undo_pad (with erase below) then emit
-        let undo = format!("\x1b[{}A\x1b[{}G\x1b[J", gap + 1, 11 + 1);
-        vt.feed(undo.as_bytes());
-        vt.feed(b"\nLine two");
+        // Word 2 crosses a line: erase old pad, emit, create new pad
+        vt.feed(b"\x1b[J"); // erase_pad
+        vt.feed(b" world\nSecond");
+        // create_pad
         vt.feed(b"\n\n\n\x1b[2K");
-        vt.feed(b"  [bar] 100%");
+        vt.feed(b"  [bar80]");
+        let up = format!("\x1b[{}A\x1b[{}G", gap + 1, 7);
+        vt.feed(up.as_bytes());
 
-        // finish — undo_pad (with erase below)
-        let undo = format!("\x1b[{}A\x1b[{}G\x1b[J", gap + 1, 8 + 1);
-        vt.feed(undo.as_bytes());
-        vt.feed(b"\n");
-
-        assert!(
-            vt.overwrites.is_empty(),
-            "overwrites:\n{}",
-            vt.overwrites.iter().map(|o| o.to_string()).collect::<Vec<_>>().join("\n")
-        );
-
-        let screen = vt.screen_text();
-        assert!(
-            screen.contains("Hello world"),
-            "missing 'Hello world' in:\n{screen}"
-        );
-        assert!(
-            screen.contains("Line two"),
-            "missing 'Line two' in:\n{screen}"
-        );
+        assert!(vt.overwrites.is_empty());
+        let s = vt.screen_text();
+        assert!(s.contains("Hello world"), "got: {s}");
+        assert!(s.contains("Second"), "got: {s}");
+        assert!(!s.contains("[bar10]"), "old bar should be gone: {s}");
+        assert!(s.contains("[bar80]"), "new bar present: {s}");
     }
 }
