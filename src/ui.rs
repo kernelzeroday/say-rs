@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::time::Duration;
 
 struct Utf16Map {
     utf16_to_byte: Vec<usize>,
@@ -56,10 +57,15 @@ impl Display {
         let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
 
         if self.interactive && byte_start >= self.emitted_up_to {
-            let mut out = io::stdout();
             let chunk = &self.text[self.emitted_up_to..byte_end];
-            write!(out, "{}", chunk).ok();
-            out.flush().ok();
+            let mut out = io::stdout();
+            for ch in chunk.chars() {
+                write!(out, "{}", ch).ok();
+                out.flush().ok();
+                if !ch.is_whitespace() {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            }
             self.emitted_up_to = byte_end;
         }
 
@@ -86,17 +92,13 @@ impl Display {
     }
 
     pub fn finish(&mut self) {
-        if self.interactive && self.emitted_up_to < self.text.len() {
+        if self.interactive {
             let mut out = io::stdout();
-            write!(out, "{}", &self.text[self.emitted_up_to..]).ok();
+            writeln!(out).ok();
             out.flush().ok();
         }
 
-        if self.interactive {
-            println!();
-        }
-
-        if self.progress {
+        if self.progress && !self.interactive {
             let width = 30;
             let mut err = io::stderr();
             write!(

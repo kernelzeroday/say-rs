@@ -8,6 +8,7 @@ use core_foundation_sys::runloop::{
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type SpeechChannelPtr = *mut c_void;
 
@@ -48,6 +49,7 @@ unsafe extern "C" {
         info: *mut VoiceDescription,
         info_length: i64,
     ) -> i16;
+    fn SpeechBusy() -> i16;
 
     static kSpeechWordCFCallBack: CFStringRef;
     static kSpeechSpeechDoneCallBack: CFStringRef;
@@ -135,7 +137,7 @@ pub fn find_voice(name: &str) -> Result<Option<VoiceSpec>, SpeechError> {
 struct CallbackContext {
     word_caller: unsafe fn(*mut c_void, usize, usize),
     word_data: *mut c_void,
-    done: bool,
+    done: AtomicBool,
 }
 
 extern "C" fn word_trampoline(
@@ -144,13 +146,13 @@ extern "C" fn word_trampoline(
     _text: CFStringRef,
     range: CFRange,
 ) {
-    let ctx = unsafe { &mut *(refcon as *mut CallbackContext) };
+    let ctx = unsafe { &*(refcon as *const CallbackContext) };
     unsafe { (ctx.word_caller)(ctx.word_data, range.location as usize, range.length as usize) };
 }
 
 extern "C" fn done_trampoline(_ch: SpeechChannelPtr, refcon: *mut c_void) {
-    let ctx = unsafe { &mut *(refcon as *mut CallbackContext) };
-    ctx.done = true;
+    let ctx = unsafe { &*(refcon as *const CallbackContext) };
+    ctx.done.store(true, Ordering::Release);
     unsafe { CFRunLoopStop(CFRunLoopGetCurrent()) };
 }
 
@@ -189,13 +191,13 @@ impl Synthesizer {
             unsafe { (*(data as *mut F))(pos, len) };
         }
 
-        let mut ctx = CallbackContext {
+        let ctx = CallbackContext {
             word_caller: call_on_word::<F>,
             word_data: &mut on_word as *mut F as *mut c_void,
-            done: false,
+            done: AtomicBool::new(false),
         };
 
-        let refcon_num = CFNumber::from(&mut ctx as *mut CallbackContext as *mut c_void as i64);
+        let refcon_num = CFNumber::from(&ctx as *const CallbackContext as *const c_void as i64);
         check(
             unsafe {
                 SetSpeechProperty(self.channel, kSpeechRefConProperty, refcon_num.as_CFTypeRef())
@@ -203,8 +205,7 @@ impl Synthesizer {
             "failed to set refcon",
         )?;
 
-        let word_num =
-            CFNumber::from(word_trampoline as *const c_void as i64);
+        let word_num = CFNumber::from(word_trampoline as *const c_void as i64);
         check(
             unsafe {
                 SetSpeechProperty(self.channel, kSpeechWordCFCallBack, word_num.as_CFTypeRef())
@@ -212,8 +213,7 @@ impl Synthesizer {
             "failed to set word callback",
         )?;
 
-        let done_num =
-            CFNumber::from(done_trampoline as *const c_void as i64);
+        let done_num = CFNumber::from(done_trampoline as *const c_void as i64);
         check(
             unsafe {
                 SetSpeechProperty(
@@ -231,11 +231,21 @@ impl Synthesizer {
             "SpeakCFString failed",
         )?;
 
-        while !ctx.done {
+        // Block until speech completes. Use CFRunLoop to pump callbacks
+        // on this thread. The done callback sets the atomic flag and
+        // stops the run loop. We also poll SpeechBusy as a fallback
+        // in case the done callback fires before the loop starts.
+        while !ctx.done.load(Ordering::Acquire) {
             unsafe {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, 0);
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, 0);
+            }
+            if unsafe { SpeechBusy() } == 0 {
+                break;
             }
         }
+
+        // Keep cf_text alive through the entire speech
+        drop(cf_text);
 
         Ok(())
     }
