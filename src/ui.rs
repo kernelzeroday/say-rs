@@ -1,6 +1,9 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
+const GAP: usize = 2;
+const CHAR_DELAY_MS: u64 = 3;
+
 struct Utf16Map {
     utf16_to_byte: Vec<usize>,
 }
@@ -39,6 +42,7 @@ pub struct Display {
     progress: bool,
     total_utf16: usize,
     emitted_up_to: usize,
+    pad_active: bool,
     is_tty: bool,
 }
 
@@ -51,44 +55,67 @@ impl Display {
             progress,
             total_utf16: text.encode_utf16().count(),
             emitted_up_to: 0,
+            pad_active: false,
             is_tty: io::stdout().is_terminal(),
         }
+    }
+
+    fn draw_bar(out: &mut io::Stdout, pct: f64) {
+        let width = 30;
+        let filled = (pct * width as f64) as usize;
+        write!(
+            out,
+            "  \x1b[2m[\x1b[32m{}{}\x1b[0;2m] {:3.0}%\x1b[0m",
+            "\u{2588}".repeat(filled),
+            "\u{2591}".repeat(width - filled),
+            pct * 100.0,
+        )
+        .ok();
     }
 
     pub fn on_word(&mut self, utf16_pos: usize, utf16_len: usize) {
         let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
 
         if self.interactive && byte_start >= self.emitted_up_to {
-            let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
             let mut out = io::stdout();
+
+            if self.progress && self.pad_active && self.is_tty {
+                write!(out, "\x1b[{}A", GAP + 1).ok();
+            }
+
+            let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
             for ch in chunk.chars() {
                 write!(out, "{}", ch).ok();
                 out.flush().ok();
                 if !ch.is_whitespace() {
-                    std::thread::sleep(Duration::from_millis(8));
+                    std::thread::sleep(Duration::from_millis(CHAR_DELAY_MS));
                 }
             }
             self.emitted_up_to = byte_end;
-        }
 
-        if self.progress && !self.interactive && self.is_tty {
-            let chars_done = utf16_pos + utf16_len;
+            if self.progress && self.is_tty {
+                let pct = if self.total_utf16 > 0 {
+                    ((utf16_pos + utf16_len) as f64 / self.total_utf16 as f64).min(1.0)
+                } else {
+                    1.0
+                };
+                for _ in 0..GAP {
+                    write!(out, "\n").ok();
+                }
+                write!(out, "\n\r\x1b[2K").ok();
+                Self::draw_bar(&mut out, pct);
+                out.flush().ok();
+                self.pad_active = true;
+            }
+        } else if self.progress && !self.interactive && self.is_tty {
             let pct = if self.total_utf16 > 0 {
-                (chars_done as f64 / self.total_utf16 as f64).min(1.0)
+                ((utf16_pos + utf16_len) as f64 / self.total_utf16 as f64).min(1.0)
             } else {
                 1.0
             };
-            let width = 30;
-            let filled = (pct * width as f64) as usize;
             let mut out = io::stdout();
-            write!(
-                out,
-                "\r  \x1b[2m[\x1b[32m{}{}\x1b[0;2m] {:3.0}%\x1b[0m",
-                "\u{2588}".repeat(filled),
-                "\u{2591}".repeat(width - filled),
-                pct * 100.0,
-            )
-            .ok();
+            write!(out, "\r\x1b[2K").ok();
+            Self::draw_bar(&mut out, pct);
             out.flush().ok();
         }
     }
@@ -97,17 +124,22 @@ impl Display {
         let mut out = io::stdout();
 
         if self.interactive {
+            if self.progress && self.pad_active && self.is_tty {
+                write!(out, "\x1b[{}A", GAP + 1).ok();
+            }
             writeln!(out).ok();
-        }
 
-        if self.progress && !self.interactive && self.is_tty {
-            let width = 30;
-            write!(
-                out,
-                "\r  \x1b[2m[\x1b[32m{}\x1b[0;2m] 100%\x1b[0m\n",
-                "\u{2588}".repeat(width),
-            )
-            .ok();
+            if self.progress && self.is_tty {
+                for _ in 0..GAP {
+                    writeln!(out).ok();
+                }
+                Self::draw_bar(&mut out, 1.0);
+                writeln!(out).ok();
+            }
+        } else if self.progress && self.is_tty {
+            write!(out, "\r\x1b[2K").ok();
+            Self::draw_bar(&mut out, 1.0);
+            writeln!(out).ok();
         }
 
         out.flush().ok();

@@ -27,7 +27,7 @@ struct Cli {
     #[arg(short = 'i', long = "interactive", default_value_t = true, action = clap::ArgAction::SetTrue)]
     interactive: bool,
 
-    /// Show progress bar (standalone, not with streaming)
+    /// Show progress bar below text
     #[arg(long = "progress")]
     progress: bool,
 
@@ -112,8 +112,7 @@ fn speak(
 }
 
 extern "C" fn handle_sigint(_: libc::c_int) {
-    let _ = io::stderr().write_all(b"\r\x1b[2K\x1b[0m");
-    let _ = io::stdout().write_all(b"\n");
+    let _ = io::stdout().write_all(b"\x1b[0m\n");
     unsafe { libc::_exit(130) };
 }
 
