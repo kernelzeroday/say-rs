@@ -237,7 +237,9 @@ impl Synthesizer {
         // in case the done callback fires before the loop starts.
         while !ctx.done.load(Ordering::Acquire) {
             unsafe {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, 0);
+                // returnAfterSourceHandled=1: process ONE callback then return,
+                // so word callbacks aren't delivered in bursts
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, 1);
             }
             if unsafe { SpeechBusy() } == 0 {
                 break;

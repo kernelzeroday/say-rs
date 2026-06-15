@@ -1,8 +1,7 @@
 use std::io::{self, IsTerminal, Write};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const GAP: usize = 2;
-const AVG_CHARS_PER_WORD: f64 = 5.5;
 
 struct Utf16Map {
     utf16_to_byte: Vec<usize>,
@@ -58,13 +57,10 @@ pub struct Display {
     term_width: usize,
     pad_drawn: bool,
     is_tty: bool,
-    start_time: Instant,
-    chars_per_sec: f64,
 }
 
 impl Display {
-    pub fn new(text: &str, interactive: bool, progress: bool, rate_wpm: f64) -> Self {
-        let cps = rate_wpm * AVG_CHARS_PER_WORD / 60.0;
+    pub fn new(text: &str, interactive: bool, progress: bool) -> Self {
         Self {
             text: text.to_string(),
             map: Utf16Map::new(text),
@@ -77,21 +73,6 @@ impl Display {
             term_width: terminal_width(),
             pad_drawn: false,
             is_tty: io::stdout().is_terminal(),
-            start_time: Instant::now(),
-            chars_per_sec: cps,
-        }
-    }
-
-    fn wait_for_speech(&self, utf16_pos: usize) {
-        if self.chars_per_sec <= 0.0 {
-            return;
-        }
-        let target_secs = utf16_pos as f64 / self.chars_per_sec;
-        let target = self.start_time + Duration::from_secs_f64(target_secs);
-        let now = Instant::now();
-        if now < target {
-            let wait = (target - now).min(Duration::from_secs(3));
-            std::thread::sleep(wait);
         }
     }
 
@@ -165,9 +146,6 @@ impl Display {
         if self.interactive && byte_start >= self.emitted_up_to {
             let mut out = io::stdout();
             let show_progress = self.progress && self.is_tty;
-
-            // Wait until speech should have reached this word
-            self.wait_for_speech(utf16_pos);
 
             let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
 
