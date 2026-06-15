@@ -1,5 +1,6 @@
 mod synth;
 mod ui;
+pub mod vterm;
 
 use clap::Parser;
 use std::io::{self, IsTerminal, Read, Write};

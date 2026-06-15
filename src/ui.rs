@@ -41,6 +41,7 @@ pub struct Display {
     progress: bool,
     total_utf16: usize,
     emitted_up_to: usize,
+    col: usize,
     pad_active: bool,
     is_tty: bool,
     prev_cb: Option<Instant>,
@@ -56,6 +57,7 @@ impl Display {
             progress,
             total_utf16: text.encode_utf16().count(),
             emitted_up_to: 0,
+            col: 0,
             pad_active: false,
             is_tty: io::stdout().is_terminal(),
             prev_cb: None,
@@ -64,28 +66,16 @@ impl Display {
     }
 
     fn calc_char_delay(&self, now: Instant, printable_chars: usize) -> Duration {
-        let Some(prev_cb) = self.prev_cb else {
-            return Duration::from_millis(5);
+        let (Some(prev_cb), Some(prev_done)) = (self.prev_cb, self.prev_emit_done) else {
+            return Duration::from_millis(4);
         };
-        let Some(prev_done) = self.prev_emit_done else {
-            return Duration::from_millis(5);
-        };
-
         let gap = now.duration_since(prev_cb);
         let our_time = prev_done.duration_since(prev_cb);
-
-        // slack = time we were idle waiting for this callback
-        // positive → we're ahead of speech, can afford to slow down
-        // zero → we were the bottleneck, need to speed up
-        let slack = gap.saturating_sub(our_time);
-        let slack_ms = slack.as_millis() as f64;
-
+        let slack_ms = gap.saturating_sub(our_time).as_millis() as f64;
         if slack_ms < 5.0 {
             return Duration::ZERO;
         }
-
-        let chars = printable_chars.max(1) as f64;
-        let delay_ms = (slack_ms * 0.7 / chars).clamp(0.0, 20.0);
+        let delay_ms = (slack_ms * 0.7 / printable_chars.max(1) as f64).clamp(0.0, 20.0);
         Duration::from_micros((delay_ms * 1000.0) as u64)
     }
 
@@ -108,7 +98,6 @@ impl Display {
         } else {
             1.0
         };
-        // blank gap lines, then progress bar on its own line
         for _ in 0..GAP {
             writeln!(out).ok();
         }
@@ -121,8 +110,7 @@ impl Display {
 
     fn undo_pad(&mut self, out: &mut io::Stdout) {
         if self.pad_active {
-            // move cursor back up past the bar + gap lines
-            write!(out, "\x1b[{}A\r", GAP + 1).ok();
+            write!(out, "\x1b[{}A\x1b[{}G", GAP + 1, self.col + 1).ok();
             self.pad_active = false;
         }
     }
@@ -145,6 +133,11 @@ impl Display {
             for ch in chunk.chars() {
                 write!(out, "{}", ch).ok();
                 out.flush().ok();
+                if ch == '\n' {
+                    self.col = 0;
+                } else {
+                    self.col += 1;
+                }
                 if !ch.is_whitespace() && !delay.is_zero() {
                     std::thread::sleep(delay);
                 }
@@ -193,5 +186,61 @@ impl Display {
         }
 
         out.flush().ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vterm::VTerm;
+
+    #[test]
+    fn pad_sequence_matches_verified_pattern() {
+        // Replay the exact byte sequence that Display would produce
+        // for two words with progress=true
+        let gap = GAP;
+        let mut vt = VTerm::new();
+
+        // Word 1: "Hello" (col 0→5)
+        vt.feed(b"Hello");
+        // draw_pad
+        vt.feed(b"\n\n\n\x1b[2K");
+        vt.feed(b"  [bar] 20%");
+
+        // Word 2: " world" — undo_pad then emit
+        let undo = format!("\x1b[{}A\x1b[{}G", gap + 1, 5 + 1);
+        vt.feed(undo.as_bytes());
+        vt.feed(b" world");
+        // draw_pad
+        vt.feed(b"\n\n\n\x1b[2K");
+        vt.feed(b"  [bar] 60%");
+
+        // Word 3: "\nLine two" — undo_pad then emit
+        let undo = format!("\x1b[{}A\x1b[{}G", gap + 1, 11 + 1);
+        vt.feed(undo.as_bytes());
+        vt.feed(b"\nLine two");
+        vt.feed(b"\n\n\n\x1b[2K");
+        vt.feed(b"  [bar] 100%");
+
+        // finish — undo_pad
+        let undo = format!("\x1b[{}A\x1b[{}G", gap + 1, 8 + 1);
+        vt.feed(undo.as_bytes());
+        vt.feed(b"\n");
+
+        assert!(
+            vt.overwrites.is_empty(),
+            "overwrites:\n{}",
+            vt.overwrites.iter().map(|o| o.to_string()).collect::<Vec<_>>().join("\n")
+        );
+
+        let screen = vt.screen_text();
+        assert!(
+            screen.contains("Hello world"),
+            "missing 'Hello world' in:\n{screen}"
+        );
+        assert!(
+            screen.contains("Line two"),
+            "missing 'Line two' in:\n{screen}"
+        );
     }
 }
