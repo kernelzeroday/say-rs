@@ -1,8 +1,7 @@
 use std::io::{self, IsTerminal, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GAP: usize = 2;
-const CHAR_DELAY_MS: u64 = 3;
 
 struct Utf16Map {
     utf16_to_byte: Vec<usize>,
@@ -44,6 +43,8 @@ pub struct Display {
     emitted_up_to: usize,
     pad_active: bool,
     is_tty: bool,
+    prev_cb: Option<Instant>,
+    prev_emit_done: Option<Instant>,
 }
 
 impl Display {
@@ -57,7 +58,35 @@ impl Display {
             emitted_up_to: 0,
             pad_active: false,
             is_tty: io::stdout().is_terminal(),
+            prev_cb: None,
+            prev_emit_done: None,
         }
+    }
+
+    fn calc_char_delay(&self, now: Instant, printable_chars: usize) -> Duration {
+        let Some(prev_cb) = self.prev_cb else {
+            return Duration::from_millis(5);
+        };
+        let Some(prev_done) = self.prev_emit_done else {
+            return Duration::from_millis(5);
+        };
+
+        let gap = now.duration_since(prev_cb);
+        let our_time = prev_done.duration_since(prev_cb);
+
+        // slack = time we were idle waiting for this callback
+        // positive → we're ahead of speech, can afford to slow down
+        // zero → we were the bottleneck, need to speed up
+        let slack = gap.saturating_sub(our_time);
+        let slack_ms = slack.as_millis() as f64;
+
+        if slack_ms < 5.0 {
+            return Duration::ZERO;
+        }
+
+        let chars = printable_chars.max(1) as f64;
+        let delay_ms = (slack_ms * 0.7 / chars).clamp(0.0, 20.0);
+        Duration::from_micros((delay_ms * 1000.0) as u64)
     }
 
     fn draw_bar(out: &mut io::Stdout, pct: f64) {
@@ -73,40 +102,61 @@ impl Display {
         .ok();
     }
 
+    fn draw_pad(&mut self, out: &mut io::Stdout, utf16_done: usize) {
+        let pct = if self.total_utf16 > 0 {
+            (utf16_done as f64 / self.total_utf16 as f64).min(1.0)
+        } else {
+            1.0
+        };
+        // blank gap lines, then progress bar on its own line
+        for _ in 0..GAP {
+            writeln!(out).ok();
+        }
+        writeln!(out).ok();
+        write!(out, "\x1b[2K").ok();
+        Self::draw_bar(out, pct);
+        out.flush().ok();
+        self.pad_active = true;
+    }
+
+    fn undo_pad(&mut self, out: &mut io::Stdout) {
+        if self.pad_active {
+            // move cursor back up past the bar + gap lines
+            write!(out, "\x1b[{}A\r", GAP + 1).ok();
+            self.pad_active = false;
+        }
+    }
+
     pub fn on_word(&mut self, utf16_pos: usize, utf16_len: usize) {
         let (byte_start, byte_end) = self.map.to_byte_range(utf16_pos, utf16_len);
 
         if self.interactive && byte_start >= self.emitted_up_to {
+            let now = Instant::now();
             let mut out = io::stdout();
 
-            if self.progress && self.pad_active && self.is_tty {
-                write!(out, "\x1b[{}A", GAP + 1).ok();
+            if self.progress && self.is_tty {
+                self.undo_pad(&mut out);
             }
 
             let chunk: String = self.text[self.emitted_up_to..byte_end].to_string();
+            let printable = chunk.chars().filter(|c| !c.is_whitespace()).count();
+            let delay = self.calc_char_delay(now, printable);
+
             for ch in chunk.chars() {
                 write!(out, "{}", ch).ok();
                 out.flush().ok();
-                if !ch.is_whitespace() {
-                    std::thread::sleep(Duration::from_millis(CHAR_DELAY_MS));
+                if !ch.is_whitespace() && !delay.is_zero() {
+                    std::thread::sleep(delay);
                 }
             }
             self.emitted_up_to = byte_end;
 
             if self.progress && self.is_tty {
-                let pct = if self.total_utf16 > 0 {
-                    ((utf16_pos + utf16_len) as f64 / self.total_utf16 as f64).min(1.0)
-                } else {
-                    1.0
-                };
-                for _ in 0..GAP {
-                    write!(out, "\n").ok();
-                }
-                write!(out, "\n\r\x1b[2K").ok();
-                Self::draw_bar(&mut out, pct);
-                out.flush().ok();
-                self.pad_active = true;
+                self.draw_pad(&mut out, utf16_pos + utf16_len);
             }
+
+            self.prev_cb = Some(now);
+            self.prev_emit_done = Some(Instant::now());
         } else if self.progress && !self.interactive && self.is_tty {
             let pct = if self.total_utf16 > 0 {
                 ((utf16_pos + utf16_len) as f64 / self.total_utf16 as f64).min(1.0)
@@ -124,8 +174,8 @@ impl Display {
         let mut out = io::stdout();
 
         if self.interactive {
-            if self.progress && self.pad_active && self.is_tty {
-                write!(out, "\x1b[{}A", GAP + 1).ok();
+            if self.progress && self.is_tty {
+                self.undo_pad(&mut out);
             }
             writeln!(out).ok();
 
