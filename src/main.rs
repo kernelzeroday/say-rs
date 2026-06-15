@@ -152,7 +152,8 @@ fn speak(
 }
 
 extern "C" fn handle_sigint(_: libc::c_int) {
-    let _ = io::stdout().write_all(b"\x1b[0m\n");
+    // Reset styles, erase from cursor to end of screen (clears pad), newline
+    let _ = io::stdout().write_all(b"\x1b[0m\x1b[J\n");
     unsafe { libc::_exit(130) };
 }
 
