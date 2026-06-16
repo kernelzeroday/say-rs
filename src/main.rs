@@ -5,7 +5,7 @@ pub mod vterm;
 use clap::Parser;
 use std::io::{self, IsTerminal, Read};
 use std::process;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "say", about = "Convert text to audible speech")]
@@ -92,170 +92,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     speak(&cli, &s, &text)
 }
 
-// --- Sentence-level chunking ---
-
-#[derive(Debug, Clone, Copy)]
-struct TextChunk<'a> {
-    text: &'a str,
-    start: usize,
-    end: usize,
-}
-
-fn chunk_text(text: &str) -> Vec<TextChunk<'_>> {
-    let mut chunks: Vec<TextChunk<'_>> = Vec::new();
-    let bytes = text.as_bytes();
-    let mut seg_start: usize = 0;
-
-    let mut i = 0;
-    while i < bytes.len() {
-        // Paragraph break: \n\n+
-        if bytes[i] == b'\n' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-            let mut end = i;
-            while end < bytes.len() && bytes[end] == b'\n' {
-                end += 1;
-            }
-            if i > seg_start {
-                chunks.push(TextChunk {
-                    text: &text[seg_start..i],
-                    start: seg_start,
-                    end: i,
-                });
-            }
-            seg_start = end;
-            i = end;
-            continue;
-        }
-
-        // Sentence end: .!? followed by space or newline, segment >= 30 bytes
-        if i - seg_start >= 30 && is_sentence_boundary(bytes, i) {
-            let end = i + 1;
-            chunks.push(TextChunk {
-                text: &text[seg_start..end],
-                start: seg_start,
-                end,
-            });
-            seg_start = end;
-            // Skip whitespace after sentence
-            while seg_start < bytes.len() && (bytes[seg_start] == b' ' || bytes[seg_start] == b'\n')
-            {
-                seg_start += 1;
-            }
-            i = seg_start;
-            continue;
-        }
-
-        // Forced break at 500 bytes
-        if i - seg_start >= 500 {
-            let mut safe_i = i;
-            while safe_i > seg_start && !text.is_char_boundary(safe_i) {
-                safe_i -= 1;
-            }
-            let search = &text[seg_start..safe_i];
-            let bp = last_sentence_boundary(search)
-                .or_else(|| search.rfind('\n').map(|p| p + 1))
-                .or_else(|| last_space_boundary(search))
-                .unwrap_or(search.len());
-            let end = seg_start + bp;
-            chunks.push(TextChunk {
-                text: &text[seg_start..end],
-                start: seg_start,
-                end,
-            });
-            seg_start = end;
-            i = end;
-            continue;
-        }
-
-        i += 1;
-    }
-
-    if seg_start < text.len() {
-        let remainder = text[seg_start..].trim();
-        if !remainder.is_empty() {
-            chunks.push(TextChunk {
-                text: &text[seg_start..],
-                start: seg_start,
-                end: text.len(),
-            });
-        }
-    }
-
-    // Merge adjacent tiny chunks (< 20 bytes) with next
-    let mut merged: Vec<TextChunk<'_>> = Vec::new();
-    let mut j = 0;
-    while j < chunks.len() {
-        let can_merge_gap = j + 1 < chunks.len()
-            && text[chunks[j].end..chunks[j + 1].start]
-                .bytes()
-                .all(|b| b == b' ');
-        if chunks[j].text.trim().len() < 8 && can_merge_gap {
-            let start = chunks[j].start;
-            let end = chunks[j + 1].end;
-            merged.push(TextChunk {
-                text: &text[start..end],
-                start,
-                end,
-            });
-            j += 2;
-        } else {
-            merged.push(chunks[j]);
-            j += 1;
-        }
-    }
-
-    if merged.is_empty() && !text.trim().is_empty() {
-        merged.push(TextChunk {
-            text,
-            start: 0,
-            end: text.len(),
-        });
-    }
-
-    merged
-}
-
-fn is_abbreviation_period(bytes: &[u8], period: usize) -> bool {
-    bytes[period] == b'.'
-        && period > 0
-        && bytes[period - 1].is_ascii_uppercase()
-        && (period < 2 || !bytes[period - 2].is_ascii_alphanumeric())
-}
-
-fn is_sentence_boundary(bytes: &[u8], i: usize) -> bool {
-    (bytes[i] == b'.' || bytes[i] == b'!' || bytes[i] == b'?')
-        && i + 1 < bytes.len()
-        && (bytes[i + 1] == b' ' || bytes[i + 1] == b'\n')
-        && !is_abbreviation_period(bytes, i)
-}
-
-fn last_sentence_boundary(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut i = bytes.len().saturating_sub(1);
-    while i > 0 {
-        if is_sentence_boundary(bytes, i) {
-            let mut end = i + 1;
-            while end < bytes.len() && (bytes[end] == b' ' || bytes[end] == b'\n') {
-                end += 1;
-            }
-            return Some(end);
-        }
-        i -= 1;
-    }
-    None
-}
-
-fn last_space_boundary(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut i = bytes.len().saturating_sub(1);
-    while i > 0 {
-        if bytes[i] == b' ' && (i == 0 || !is_abbreviation_period(bytes, i - 1)) {
-            return Some(i + 1);
-        }
-        i -= 1;
-    }
-    None
-}
-
 // --- UTF-16 callback mapping ---
 
 struct Utf16Map {
@@ -282,25 +118,72 @@ impl Utf16Map {
     }
 }
 
-// --- Word helpers ---
+// --- Size-based chunking with smart break points ---
 
-fn word_end_bytes(text: &str) -> Vec<usize> {
-    let mut ends = Vec::new();
-    let mut in_word = false;
-    for (i, ch) in text.char_indices() {
-        if ch.is_whitespace() {
-            if in_word {
-                ends.push(i);
-                in_word = false;
-            }
-        } else {
-            in_word = true;
+const MAX_CHUNK: usize = 2000;
+
+fn split_chunks(text: &str) -> Vec<(usize, &str)> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    if text.len() <= MAX_CHUNK {
+        return vec![(0, text)];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+
+    while start < text.len() {
+        while start < text.len() && text.as_bytes()[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        if start >= text.len() {
+            break;
+        }
+        if text.len() - start <= MAX_CHUNK {
+            chunks.push((start, &text[start..]));
+            break;
+        }
+
+        let bp = snap_to_break(&text[start..], MAX_CHUNK);
+        chunks.push((start, &text[start..start + bp]));
+        start += bp;
+    }
+
+    chunks
+}
+
+fn snap_to_break(text: &str, max: usize) -> usize {
+    let mut limit = max.min(text.len());
+    while limit > 0 && !text.is_char_boundary(limit) {
+        limit -= 1;
+    }
+
+    let bytes = &text.as_bytes()[..limit];
+    let floor = limit / 4;
+
+    for i in (floor..bytes.len().saturating_sub(1)).rev() {
+        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+            return i;
         }
     }
-    if in_word {
-        ends.push(text.len());
+    for i in (floor..bytes.len()).rev() {
+        if bytes[i] == b'\n' {
+            return i;
+        }
     }
-    ends
+    for i in (floor..bytes.len().saturating_sub(1)).rev() {
+        if matches!(bytes[i], b'.' | b'!' | b'?') && bytes[i + 1] == b' ' {
+            return i + 1;
+        }
+    }
+    for i in (floor..bytes.len()).rev() {
+        if bytes[i] == b' ' {
+            return i;
+        }
+    }
+
+    limit
 }
 
 // --- Speaking with sync ---
@@ -317,68 +200,55 @@ fn speak(cli: &Cli, s: &synth::Synthesizer, text: &str) -> Result<(), Box<dyn st
     let progress = cli.progress && !cli.quiet && stdout_tty;
     let debug = cli.debug;
 
-    let chunks = chunk_text(text);
+    let paras = split_chunks(text);
 
     if debug {
         let rate_wpm = s.get_rate().unwrap_or(DEFAULT_RATE);
-        eprintln!("[debug] rate={:.0} wpm, chunks={}", rate_wpm, chunks.len());
-        for (i, c) in chunks.iter().enumerate() {
-            let words = word_end_bytes(c.text).len();
-            let preview: String = c.text.chars().take(60).collect();
-            let preview = preview.replace('\n', "\\n");
-            eprintln!(
-                "[debug] chunk[{}]: {} words, {} bytes @{}..{}: {:?}",
-                i,
-                words,
-                c.text.len(),
-                c.start,
-                c.end,
-                preview
-            );
-        }
+        eprintln!(
+            "[debug] rate={:.0} wpm, {} bytes, {} paragraphs",
+            rate_wpm,
+            text.len(),
+            paras.len()
+        );
     }
 
     if interactive || progress {
         let mut display = ui::Display::new(text, interactive, progress);
+        let rate_wpm = s.get_rate().unwrap_or(DEFAULT_RATE);
+        let word_interval = Duration::from_secs_f64(60.0 / rate_wpm);
 
-        for (ci, chunk) in chunks.iter().enumerate() {
-            let utf16_map = Utf16Map::new(chunk.text);
-            let expected_words = word_end_bytes(chunk.text).len();
-            let mut session = s.start_speaking(chunk.text)?;
+        for &(offset, para) in &paras {
+            let utf16_map = Utf16Map::new(para);
+            let mut session = s.start_speaking(para)?;
             let t0 = Instant::now();
-            let mut observed_words: usize = 0;
+            let mut words: u32 = 0;
 
             loop {
                 let finished = session.pump(0.01);
                 for ev in session.drain_words() {
-                    observed_words += 1;
+                    words += 1;
+                    let target = word_interval * words;
+                    let elapsed = t0.elapsed();
+                    if target > elapsed {
+                        std::thread::sleep(target - elapsed);
+                    }
                     let utf16_end = ev.utf16_pos.saturating_add(ev.utf16_len);
                     let byte_end = utf16_map.to_byte(utf16_end);
-                    display.emit_up_to(chunk.start + byte_end);
+                    display.emit_up_to(offset + byte_end);
                 }
-
                 if finished {
                     break;
                 }
             }
 
-            display.emit_up_to(chunk.end);
-
-            if debug {
-                eprintln!(
-                    "[debug] chunk[{}]: callbacks={}/{} actual={:.2}s",
-                    ci,
-                    observed_words,
-                    expected_words,
-                    t0.elapsed().as_secs_f64(),
-                );
-            }
+            display.emit_up_to(offset + para.len());
         }
 
+        display.emit_up_to(text.len());
         display.finish();
     } else {
-        for chunk in &chunks {
-            s.speak(chunk.text, |_, _| {})?;
+        for &(_, para) in &paras {
+            s.speak(para, |_, _| {})?;
         }
     }
 
@@ -416,142 +286,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn word_ends_basic() {
-        assert_eq!(word_end_bytes("Hello world"), vec![5, 11]);
+    fn chunks_short_text_single() {
+        let text = "Hello world, this is short.";
+        let c = split_chunks(text);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0], (0, text));
     }
 
     #[test]
-    fn word_ends_multiline() {
-        assert_eq!(word_end_bytes("Hello\nworld"), vec![5, 11]);
+    fn chunks_long_splits_at_sentence() {
+        let a = "x".repeat(1800);
+        let text = format!("{}. {}", a, "y".repeat(500));
+        let c = split_chunks(&text);
+        assert!(c.len() >= 2, "should split: {:?}", c.len());
+        assert!(c[0].1.ends_with('.'));
     }
 
     #[test]
-    fn word_ends_empty() {
-        assert_eq!(word_end_bytes(""), Vec::<usize>::new());
+    fn chunks_prefers_paragraph_break() {
+        let a = "word ".repeat(350);
+        let b = "more ".repeat(200);
+        let text = format!("{}\n\n{}", a.trim(), b.trim());
+        let c = split_chunks(&text);
+        assert!(c.len() >= 2);
     }
 
     #[test]
-    fn chunk_splits_sentences() {
-        let text = "Hello world. This is a second sentence. And a third one.";
-        let chunks = chunk_text(text);
-        assert!(
-            chunks.len() >= 2,
-            "should split at sentence boundaries: {:?}",
-            chunks
-        );
-        assert_eq!(chunks[0].text, "Hello world. This is a second sentence.");
-        assert_eq!(chunks[1].start, text.find("And").unwrap());
-    }
-
-    #[test]
-    fn chunk_splits_paragraphs() {
-        let text = "First paragraph.\n\nSecond paragraph.";
-        let chunks = chunk_text(text);
-        assert_eq!(chunks.len(), 2, "chunks: {:?}", chunks);
-    }
-
-    #[test]
-    fn chunk_skips_abbreviations() {
-        let text = "Dr. Smith went to Washington D.C. and met Mr. Jones for lunch.";
-        let chunks = chunk_text(text);
-        // "D.C." and "Dr." and "Mr." should not cause splits (single uppercase before period)
-        // Only "lunch." at end
-        assert!(
-            chunks.len() <= 2,
-            "too many splits on abbreviations: {:?}",
-            chunks
-        );
-    }
-
-    #[test]
-    fn chunk_merges_tiny() {
-        let text = "Hi.\n\nBye world and more text here please.";
-        let chunks = chunk_text(text);
-        assert!(chunks.len() <= 2, "tiny chunk not merged: {:?}", chunks);
-    }
-
-    #[test]
-    fn chunk_tiny_merge_does_not_cross_paragraph_break() {
-        let text = "OK.\n\nThis is a longer second paragraph.";
-        let chunks = chunk_text(text);
-        assert_eq!(
-            chunks.len(),
-            2,
-            "paragraph chunks should stay split: {:?}",
-            chunks
-        );
-        assert_eq!(chunks[0].text, "OK.");
-        assert_eq!(chunks[1].text, "This is a longer second paragraph.");
-    }
-
-    #[test]
-    fn chunk_handles_long() {
-        let text = "a ".repeat(300);
-        let chunks = chunk_text(&text);
-        assert!(chunks.len() >= 2);
-        for c in &chunks {
-            assert!(
-                c.text.len() <= 510,
-                "chunk too large: {} bytes",
-                c.text.len()
-            );
-        }
-    }
-
-    #[test]
-    fn chunk_handles_multibyte() {
-        // 3-byte UTF-8 chars (smart quotes, em dashes)
-        let text = "\u{201c}Hello\u{201d} world \u{2014} this is a test. Second sentence here. Third one too. Fourth also. Fifth as well.";
-        let chunks = chunk_text(text);
-        for c in &chunks {
-            // Verify all chunks are valid UTF-8 (no panics on slice)
-            let _ = c.text.len();
-            assert!(!c.text.is_empty());
-        }
-    }
-
-    #[test]
-    fn chunk_long_multibyte() {
-        // Force a 500-byte break with multibyte chars
-        let word = "\u{201c}test\u{201d} ";
-        let text = word.repeat(100); // ~800 bytes
-        let chunks = chunk_text(&text);
-        assert!(chunks.len() >= 2, "should split long multibyte text");
-        for c in &chunks {
-            let _ = c.text.len();
-        }
-    }
-
-    #[test]
-    fn forced_break_does_not_prefer_abbreviation_period() {
-        let text = format!("{}U.S. {}", "a ".repeat(247), "b ".repeat(80));
-        let chunks = chunk_text(&text);
-        assert!(chunks.len() >= 2, "long input should be forced into chunks");
-        assert!(
-            chunks[1].text.starts_with("U.S."),
-            "forced break should move abbreviation to next chunk: {:?}",
-            chunks
-        );
-    }
-
-    #[test]
-    fn chunk_offsets_include_skipped_space_before_multibyte_word() {
-        let text = "This first sentence is longer than thirty bytes. caf\u{e9} wins.";
-        let chunks = chunk_text(text);
-        let second = chunks
-            .iter()
-            .find(|chunk| chunk.text.starts_with("caf\u{e9}"))
-            .expect("second chunk should start at the multibyte word");
-
-        assert_eq!(second.start, text.find("caf\u{e9}").unwrap());
-
-        let map = Utf16Map::new(second.text);
-        let utf16_word_end = "caf\u{e9}".encode_utf16().count();
-        let absolute_end = second.start + map.to_byte(utf16_word_end);
-        assert_eq!(
-            &text[..absolute_end],
-            "This first sentence is longer than thirty bytes. caf\u{e9}"
-        );
+    fn chunks_no_empty() {
+        let c = split_chunks("   \n\n  ");
+        assert!(c.is_empty());
     }
 
     #[test]

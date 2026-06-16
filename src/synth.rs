@@ -1,7 +1,10 @@
 use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use core_foundation_sys::base::{CFRange, CFTypeRef};
+use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::runloop::{
     CFRunLoopGetCurrent, CFRunLoopRunInMode, CFRunLoopStop, kCFRunLoopDefaultMode,
 };
@@ -9,7 +12,10 @@ use std::ffi::c_void;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 type SpeechChannelPtr = *mut c_void;
 
@@ -39,7 +45,7 @@ pub struct VoiceDescription {
 unsafe extern "C" {
     fn NewSpeechChannel(voice: *const VoiceSpec, chan: *mut SpeechChannelPtr) -> i16;
     fn DisposeSpeechChannel(chan: SpeechChannelPtr) -> i16;
-    fn SpeakCFString(chan: SpeechChannelPtr, text: CFStringRef, options: *const c_void) -> i16;
+    fn SpeakCFString(chan: SpeechChannelPtr, text: CFStringRef, options: CFDictionaryRef) -> i16;
     #[allow(dead_code)]
     fn StopSpeech(chan: SpeechChannelPtr) -> i16;
     fn SetSpeechProperty(chan: SpeechChannelPtr, property: CFStringRef, object: CFTypeRef) -> i16;
@@ -62,6 +68,8 @@ unsafe extern "C" {
     static kSpeechSpeechDoneCallBack: CFStringRef;
     static kSpeechRefConProperty: CFStringRef;
     static kSpeechRateProperty: CFStringRef;
+    static kSpeechNoEndingProsody: CFStringRef;
+    static kSpeechNoSpeechInterrupt: CFStringRef;
 }
 
 #[derive(Debug)]
@@ -148,7 +156,7 @@ pub struct WordEvent {
 }
 
 struct CallbackCollector {
-    words: Vec<WordEvent>,
+    words: Mutex<Vec<WordEvent>>,
     done: AtomicBool,
 }
 
@@ -161,11 +169,13 @@ extern "C" fn collect_word(
     if refcon.is_null() {
         return;
     }
-    let ctx = unsafe { &mut *(refcon as *mut CallbackCollector) };
-    ctx.words.push(WordEvent {
-        utf16_pos: range.location.max(0) as usize,
-        utf16_len: range.length.max(0) as usize,
-    });
+    let ctx = unsafe { &*(refcon as *const CallbackCollector) };
+    if let Ok(mut words) = ctx.words.lock() {
+        words.push(WordEvent {
+            utf16_pos: range.location.max(0) as usize,
+            utf16_len: range.length.max(0) as usize,
+        });
+    }
 }
 
 extern "C" fn collect_done(_ch: SpeechChannelPtr, refcon: *mut c_void) {
@@ -200,7 +210,11 @@ impl SpeechSession<'_> {
     }
 
     pub fn drain_words(&mut self) -> Vec<WordEvent> {
-        std::mem::take(&mut self.collector.words)
+        self.collector
+            .words
+            .lock()
+            .map(|mut words| std::mem::take(&mut *words))
+            .unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -222,6 +236,16 @@ fn clear_session_callbacks(channel: SpeechChannelPtr) {
         clear_speech_property(channel, kSpeechSpeechDoneCallBack);
         clear_speech_property(channel, kSpeechRefConProperty);
     }
+}
+
+fn speech_options() -> CFDictionary<CFString, CFBoolean> {
+    let no_ending_prosody = unsafe { CFString::wrap_under_get_rule(kSpeechNoEndingProsody) };
+    let no_speech_interrupt = unsafe { CFString::wrap_under_get_rule(kSpeechNoSpeechInterrupt) };
+
+    CFDictionary::from_CFType_pairs(&[
+        (no_ending_prosody, CFBoolean::true_value()),
+        (no_speech_interrupt, CFBoolean::true_value()),
+    ])
 }
 
 impl Drop for SpeechSession<'_> {
@@ -276,7 +300,7 @@ impl Synthesizer {
 
     pub fn start_speaking(&self, text: &str) -> Result<SpeechSession<'_>, SpeechError> {
         let collector = Box::new(CallbackCollector {
-            words: Vec::new(),
+            words: Mutex::new(Vec::new()),
             done: AtomicBool::new(false),
         });
 
@@ -286,6 +310,7 @@ impl Synthesizer {
         let done_num = CFNumber::from(collect_done as *const c_void as i64);
 
         let cf_text = CFString::new(text);
+        let options = speech_options();
         let setup_result = (|| {
             check(
                 unsafe {
@@ -314,7 +339,13 @@ impl Synthesizer {
                 "failed to set done callback",
             )?;
             check(
-                unsafe { SpeakCFString(self.channel, cf_text.as_concrete_TypeRef(), ptr::null()) },
+                unsafe {
+                    SpeakCFString(
+                        self.channel,
+                        cf_text.as_concrete_TypeRef(),
+                        options.as_concrete_TypeRef(),
+                    )
+                },
                 "SpeakCFString failed",
             )
         })();
@@ -373,22 +404,25 @@ mod tests {
 
     #[test]
     fn word_event_drain() {
-        let mut collector = CallbackCollector {
-            words: Vec::new(),
+        let collector = CallbackCollector {
+            words: Mutex::new(Vec::new()),
             done: AtomicBool::new(false),
         };
-        collector.words.push(WordEvent {
-            utf16_pos: 0,
-            utf16_len: 5,
-        });
-        collector.words.push(WordEvent {
-            utf16_pos: 6,
-            utf16_len: 5,
-        });
-        let drained: Vec<WordEvent> = std::mem::take(&mut collector.words);
+        {
+            let mut words = collector.words.lock().unwrap();
+            words.push(WordEvent {
+                utf16_pos: 0,
+                utf16_len: 5,
+            });
+            words.push(WordEvent {
+                utf16_pos: 6,
+                utf16_len: 5,
+            });
+        }
+        let drained: Vec<WordEvent> = std::mem::take(&mut *collector.words.lock().unwrap());
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].utf16_pos, 0);
         assert_eq!(drained[1].utf16_pos, 6);
-        assert!(collector.words.is_empty());
+        assert!(collector.words.lock().unwrap().is_empty());
     }
 }
